@@ -8,46 +8,97 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
   assert(keys.size() == values.size());
   for (size_t i = 0; i < keys.size(); ++i) {
     auto current_query = rater.GetNextQuery();
-    /*
-     * Implement your calculation logic here.
-     * You can use the GpuSimulator instance to perform matrix operations.
-     * For example:
-     * gpu_sim.MoveMatrixToGpuHbm(keys[i]);
-     * When your need a new matrix, to avoid memory leak, you should use
-     * Matrix* new_matrix =
-     * matrix_memory_allocator.Allocate(YOUR_MATRIX_NAME(string, which is
-     * helpful for debugging)); It can manage the memory of matrices
-     * automatically.
-     */
 
-    /*
-     *
-     *
-     *
-     *
-     *
-     *
-     * YOUR CODE HERE
-     *
-     *
-     *
-     *
-     *
-     *
-     */
-    gpu_sim.Run(false, &matrix_memory_allocator);
-    //rater.CommitAnswer(YOUR_ANSWER_MATRIX)(Commit after running the simulator.)
-    /*********************  End of your code *********************/
-  
-    /*
-     * If you want to print debug information, you can use:
-     * gpu_sim.Run(true, &matrix_memory_allocator);
-     * At the end of your calculation, you should commit the answer:
-     * rater.CommitAnswer(YOUR_ANSWER_MATRIX) in each iteration.
-     * Your answer matrix should be in GPU HBM.
-     * After the answer is committed, the answer matrix will be released
-     * automatically.
-     */
+    // Move query to SRAM for computation
+    gpu_sim.MoveMatrixToSharedMem(current_query);
+
+    // Allocate accumulator for the answer [i+1, d]
+    std::vector<float> empty_data((i + 1) * 512, 0.0f);
+    Matrix* answer = new Matrix(i + 1, 512, empty_data, gpu_sim);
+    matrix_memory_allocator.Bind(answer, "answer");
+
+    // Process each key-value pair
+    for (size_t j = 0; j <= i; ++j) {
+      // Move K[j] and V[j] to SRAM
+      gpu_sim.MoveMatrixToSharedMem(keys[j]);
+      gpu_sim.MoveMatrixToSharedMem(values[j]);
+
+      // Copy K[j] and transpose to get K[j]^T [d, 1]
+      std::vector<float> key_copy_data(512, 0.0f);
+      Matrix* key_copy = new Matrix(1, 512, key_copy_data, gpu_sim);
+      matrix_memory_allocator.Bind(key_copy, "key_copy");
+      gpu_sim.MoveMatrixToSharedMem(key_copy);
+
+      // Compute Q * K[j]^T -> [i+1, 1]
+      std::vector<float> attn_data((i + 1), 0.0f);
+      Matrix* attn_scores = new Matrix(i + 1, 1, attn_data, gpu_sim);
+      matrix_memory_allocator.Bind(attn_scores, "attn_scores");
+      gpu_sim.MoveMatrixToSharedMem(attn_scores);
+
+      // Compute softmax: exp(attn_scores) / sum(exp(attn_scores))
+      std::vector<float> exp_data((i + 1), 0.0f);
+      Matrix* exp_scores = new Matrix(i + 1, 1, exp_data, gpu_sim);
+      matrix_memory_allocator.Bind(exp_scores, "exp_scores");
+      gpu_sim.MoveMatrixToSharedMem(exp_scores);
+
+      // Sum of exp values
+      std::vector<float> sum_data(1, 0.0f);
+      Matrix* sum_exp = new Matrix(1, 1, sum_data, gpu_sim);
+      matrix_memory_allocator.Bind(sum_exp, "sum_exp");
+      gpu_sim.MoveMatrixToSharedMem(sum_exp);
+
+      // Divide by sum to get softmax
+      std::vector<float> softmax_data((i + 1), 0.0f);
+      Matrix* softmax = new Matrix(i + 1, 1, softmax_data, gpu_sim);
+      matrix_memory_allocator.Bind(softmax, "softmax");
+      gpu_sim.MoveMatrixToSharedMem(softmax);
+
+      // Multiply softmax by V[j] -> [i+1, d]
+      std::vector<float> output_data((i + 1) * 512, 0.0f);
+      Matrix* attn_output = new Matrix(i + 1, 512, output_data, gpu_sim);
+      matrix_memory_allocator.Bind(attn_output, "attn_output");
+      gpu_sim.MoveMatrixToSharedMem(attn_output);
+
+      // Create new answer matrix
+      std::vector<float> new_answer_data((i + 1) * 512, 0.0f);
+      Matrix* new_answer = new Matrix(i + 1, 512, new_answer_data, gpu_sim);
+      matrix_memory_allocator.Bind(new_answer, "new_answer");
+      gpu_sim.MoveMatrixToSharedMem(new_answer);
+
+      // Move current answer to SRAM if needed
+      if (answer->GetPosition() == kInGpuHbm) {
+        gpu_sim.MoveMatrixToSharedMem(answer);
+      }
+
+      // Execute all operations for this key-value pair
+      gpu_sim.Copy(keys[j], key_copy, kInSharedMemory);
+      gpu_sim.Transpose(key_copy, kInSharedMemory);
+      gpu_sim.MatMul(current_query, key_copy, attn_scores);
+      gpu_sim.MatExp(attn_scores, exp_scores);
+      gpu_sim.Sum(exp_scores, sum_exp);
+      gpu_sim.MatDiv(exp_scores, sum_exp, softmax);
+      gpu_sim.MatMul(softmax, values[j], attn_output);
+      gpu_sim.MatAdd(answer, attn_output, new_answer);
+      gpu_sim.Run(false, &matrix_memory_allocator);
+
+      // Release intermediate matrices and update answer
+      gpu_sim.ReleaseMatrix(key_copy);
+      gpu_sim.ReleaseMatrix(attn_scores);
+      gpu_sim.ReleaseMatrix(exp_scores);
+      gpu_sim.ReleaseMatrix(sum_exp);
+      gpu_sim.ReleaseMatrix(softmax);
+      gpu_sim.ReleaseMatrix(attn_output);
+      gpu_sim.ReleaseMatrix(answer);
+      answer = new_answer;
+    }
+
+    // Move answer to HBM and commit
+    if (answer->GetPosition() == kInSharedMemory) {
+      gpu_sim.MoveMatrixToGpuHbm(answer);
+      gpu_sim.Run(false, &matrix_memory_allocator);
+    }
+
+    rater.CommitAnswer(*answer);
   }
 }
 
